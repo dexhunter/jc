@@ -709,85 +709,95 @@ def expansion_check(data: object, input_size: int) -> None:
             f'expand to more than {limit} characters.'
         )
 
-    # sizes of objects already walked, keyed by id(). The object is kept
-    # in the value so its id cannot be reused during the walk.
-    sizes: Dict[int, Tuple[object, int]] = {}
-    in_progress: Set[int] = set()
+    # Memo sizes include a separator; active containers count only that.
+    # Retain objects to prevent id reuse during the walk.
+    sizes: Dict[int, int] = {}
+    retained: List[object] = []
+    get_size = sizes.get
+    container_types = (dict, list, tuple)
+    scalar_types = (str, int, float, bytes)
+    cached_types = scalar_types + (bool, type(None))
 
-    def known_size(obj: object) -> Optional[int]:
-        """Return the size of a scalar or an already walked object, else None"""
-        if isinstance(obj, (dict, list, tuple)):
-            obj_id = id(obj)
-            if obj_id in sizes:
-                return sizes[obj_id][1]
-            if obj_id in in_progress:
-                # circular reference: cannot be serialized, so not counted
-                return 0
-            return None
-        if obj is None or isinstance(obj, (str, int, float, bytes)):
-            return _scalar_json_size(obj)
-        obj_id = id(obj)
-        if obj_id not in sizes:
-            sizes[obj_id] = (obj, _scalar_json_size(obj))
-        return sizes[obj_id][1]
+    def known_size(obj: object, obj_id: int) -> Optional[int]:
+        """Return size plus a separator, or None for an unseen container."""
+        cache_size = True
+        if type(obj) not in cached_types:
+            if isinstance(obj, container_types):
+                return None
+            # Scalar subclasses may have conversion side effects.
+            cache_size = not isinstance(obj, scalar_types)
 
-    def new_frame(obj: Any) -> List[Any]:
-        """[object, is_dict, iterator, running size]
+        size = _scalar_json_size(obj) + 1
+        if cache_size:
+            sizes[obj_id] = size
+            retained.append(obj)
+        return size
+
+    def new_frame(obj: Any, obj_id: int) -> Tuple[Any, ...]:
+        """(object, is_dict, iterator, running size)
 
         Each item adds one separator (the opening bracket counts as the
         first), so an empty container is fixed up when it is finished.
         """
-        in_progress.add(id(obj))
+        sizes[obj_id] = 1
+        retained.append(obj)
         if isinstance(obj, dict):
-            return [obj, True, iter(obj.items()), 1]
-        return [obj, False, iter(obj), 1]
+            return obj, True, iter(obj.items()), 1
+        return obj, False, iter(obj), 1
 
-    size = known_size(data)
+    data_id = id(data)
+    size = known_size(data, data_id)
     if size is not None:
-        if size > limit:
+        if size - 1 > limit:
             raise too_large()
         return
 
-    stack = [new_frame(data)]
+    obj, is_dict, iterator, total = new_frame(data, data_id)
+    stack = []
 
-    while stack:
-        frame = stack[-1]
-        descend = False
+    while True:
+        previous = obj
+        previous_size = 1
 
-        for item in frame[2]:
-            if frame[1]:
+        for item in iterator:
+            if is_dict:
                 key, value = item
-                frame[3] += _scalar_json_size(key) + 2
+                total += _scalar_json_size(key) + 1
             else:
                 value = item
-                frame[3] += 1
 
-            size = known_size(value)
-            if size is None:
-                stack.append(new_frame(value))
-                descend = True
-                break
+            if value is previous:
+                size = previous_size
+            else:
+                value_id = id(value)
+                size = get_size(value_id)
+                if size is None:
+                    size = known_size(value, value_id)
+                    if size is None:
+                        stack.append((obj, is_dict, iterator, total + 1))
+                        obj, is_dict, iterator, total = new_frame(
+                            value, value_id)
+                        break
+                else:
+                    previous = value
+                    previous_size = size
 
-            frame[3] += size
-            if frame[3] > limit:
+            total += size
+            if total > limit:
                 raise too_large()
+        else:
+            if not obj:
+                total += 1
+            sizes[id(obj)] = total + 1
 
-        if descend:
-            continue
-
-        stack.pop()
-        obj = frame[0]
-        if not obj:
-            frame[3] += 1
-        in_progress.discard(id(obj))
-        sizes[id(obj)] = (obj, frame[3])
-
-        if stack:
-            stack[-1][3] += frame[3]
-            if stack[-1][3] > limit:
+            finished = not stack
+            if stack:
+                obj, is_dict, iterator, parent_total = stack.pop()
+                total += parent_total
+            if total > limit:
                 raise too_large()
-        elif frame[3] > limit:
-            raise too_large()
+            if finished:
+                return
 
 
 class _StopDefaultsCheck(Exception):
